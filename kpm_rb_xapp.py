@@ -19,8 +19,10 @@ DEBUG = ("--DEBUG" in sys.argv) # The Debug mode switch
 class MACCallback(ric.mac_cb): 
     def __init__(self,owner):
         super().__init__() # Call the parent class constructor
-        ric.mac_cb.__init__(self)
-        self.owner=owner # This is pointer to Kpm_rb_xapp self
+        self.owner = owner
+        self.prev_prb = {} # key   : rnti 
+                           # value : last ul_aggr_prb 
+                           # job : store the last prb states
 
     def handle(self,ind):
         # TODO: after ind_msg will parse the {ue,rb_usage}
@@ -32,36 +34,40 @@ class MACCallback(ric.mac_cb):
             print("[MACCallback] no ue_stats in indication")
             return
         
-        ue_0 = ind.ue_stats[0]
+        # The ue kpm catch 
+        for ue_stat in ind.ue_stats:
+            ue = ue_stat.rnti
+        #== The prb recoding area ==
+            curr_prb = float(ue_stat.ul_aggr_prb) # The current prb usage
+            prev_prb = self.prev_prb.get(ue,curr_prb) # The key protect
+            delta_prb = max(curr_prb - prev_prb,0.0) # The prb increase
+            self.prev_prb[ue] = curr_prb # The prb update
 
-        # This is display comlumn name
-       
-        if DEBUG:
-            attrs = [a for a in dir(ue_0)if not a.startswith('_')]
-            print("[MACCallback] ue_0 attrs : ",attrs)
-
-
-        ue = ue_0.rnti # watch first ue rnti code
-        max_ul_rb = 100.0
-
-        try:
-            ul_sched_rb = float(ue_0.ul_sched_rb)
-            rb_usage =  min((ul_sched_rb/max_ul_rb),1.0)
-            
-        except AttributeError:
-            print("[MACCallback] ue_0 Don't have ul_sched_rb format , setting 0 .")
-            rb_usage = 0.0
-
-        kpm_msg ={
+            kpm_msg ={
             "ue":ue,
-            "rb_usage":rb_usage
+            "delta_prb": delta_prb
         }
 
-        print(f"[MAC] ue={ue}," 
-              f"ul_sched_rb={ul_sched_rb:.1f}," 
-              f"rb_usage={rb_usage:.3f}\n,")
+            self.owner.on_kpm_report(kpm_msg)
         
-        self.owner.on_kpm_report(kpm_msg)
+
+        # if DEBUG:
+        #     attrs = [a for a in dir(ue_0)if not a.startswith('_')]
+        #     print("[MACCallback] ue_0 attrs : ",attrs)
+
+   
+        #=== The prb usage ====
+        max_prb_window = 100.0 # The prb window size
+        # rb_usage = min (delta_prb / max_prb_window,1.0) # The rb usage calculate
+
+        print(f"[MAC] ue={ue}, curr_ul_aggr_prb={curr_prb:.1f}, "
+              f"delta_ul_prb={delta_prb:.1f}")
+
+        # print(f"[MAC] ue={ue}," 
+        #       f"ul_sched_rb={delta_prb:.1f},"  # The display different rb usage 
+        #       f"rb_usage={rb_usage:.3f}\n,")
+        
+
         # the self owner space is store the kpm_msg data sturct 
 
 
@@ -85,7 +91,7 @@ class Kpm_Rb_Xapp:
         self.ul_threshold = 0.7
         # step 4 : The sample accroding parameter
         # sampling parameter. 
-
+        self.prb_per_slot = 106
         self.batch_size = 10 
         self.sample_size = 3 
         self.batch_buffer = [] 
@@ -101,7 +107,7 @@ class Kpm_Rb_Xapp:
 
         # step 1. from batch_buffer sampling sample_size 
         if(len(self.batch_buffer)<= self.sample_size):
-            samples = self.batch_buffer[:] # All get if insufficient.
+            samples = self.batch_buffer[-self.sample_size:] # All get if insufficient.
         else:
             samples = random.sample(self.batch_buffer,self.sample_size)     
                                   # The maternal , sampling size
@@ -110,15 +116,21 @@ class Kpm_Rb_Xapp:
         rb_list = []
 
         for sample in samples:
-            rb_list.append(sample["kpm_message"]["rb_usage"])
+            rb_list.append(sample["kpm_message"]["delta_prb"])
         
-        avg_rb = sum(rb_list)/len(rb_list)
+        sum_delta = sum(rb_list)
 
+        # The PRB slot clculate
+        max_capacity = self.prb_per_slot * len(samples) # The max prb capacity in the sample window
+        rb_usage = 0.0
+
+        if max_capacity > 0:
+            rb_usage = min(sum_delta / max_capacity,1.0)
 
         # step 3. The sample first ue is symbol ue 
         ue = samples[0]["kpm_message"]["ue"]
 
-
+        avg_rb = sum_delta / max_capacity if max_capacity > 0 else 0.0
         # step 4. make this sample symbol recoding  
         # and put in the kpm_buffer for long store
         record = {
@@ -127,7 +139,7 @@ class Kpm_Rb_Xapp:
                 "kpm_message":{
                 
                     "ue":ue,
-                    "rb_usage":avg_rb
+                    "rb_usage":rb_usage
                 }
             }
          
@@ -136,11 +148,12 @@ class Kpm_Rb_Xapp:
         if(len(self.kpm_buffer) > 1000):
             self.kpm_buffer.pop(0)
 
-        time_stamp =record["time_stamp"]    
+        time_stamp =record["time_stamp"]
         t_s_str = time.strftime("%H:%M:%S", time.localtime(time_stamp))
-
+        
         print(f" [ aggregate {t_s_str} ] batch_size = {len(self.batch_buffer)},"
-              f" avg_rb={avg_rb:.2f}, min={min(rb_list):.2f}, max={max(rb_list):.2f}")
+              f" avg_rb={rb_usage:.2f}, sum_delta={sum_delta:.1f},"
+              f" min={min(rb_list):.2f}, max={max(rb_list):.2f}")
 
         # step 5. Use this sample info do decision make Rb Policy
         self.apply_rb_control(record["kpm_message"])
